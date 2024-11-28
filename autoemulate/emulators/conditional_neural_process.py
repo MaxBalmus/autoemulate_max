@@ -21,7 +21,7 @@ from autoemulate.emulators.neural_networks.datasets import cnp_collate_fn
 from autoemulate.emulators.neural_networks.datasets import CNPDataset
 from autoemulate.emulators.neural_networks.losses import CNPLoss
 from autoemulate.utils import set_random_seed
-
+from autoemulate.emulators.gaussian_process_utils import EarlyStoppingCustom
 
 class ConditionalNeuralProcess(RegressorMixin, BaseEstimator):
     """
@@ -119,14 +119,17 @@ class ConditionalNeuralProcess(RegressorMixin, BaseEstimator):
         # training
         max_epochs=100,
         lr=5e-3,
+        weight_decay=0.0,
         batch_size=16,
         activation=nn.ReLU,
         optimizer=torch.optim.AdamW,
+        patience=10,
         normalize_y=True,
         # misc
         device="cpu",
         random_state=None,
         attention=False,
+        verbose=0,
     ):
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
@@ -140,7 +143,10 @@ class ConditionalNeuralProcess(RegressorMixin, BaseEstimator):
         self.batch_size = batch_size
         self.activation = activation
         self.optimizer = optimizer
+        self.weight_decay = weight_decay
+        self.patience = patience
         self.normalize_y = normalize_y
+        self.verbose = verbose
         self.attention = attention
         self.device = device
         self.random_state = random_state
@@ -178,7 +184,7 @@ class ConditionalNeuralProcess(RegressorMixin, BaseEstimator):
 
         if self.random_state is not None:
             set_random_seed(self.random_state)
-
+        
         module = CNPModule if not self.attention else AttnCNPModule
         self.model_ = NeuralNetRegressor(
             module,
@@ -196,21 +202,21 @@ class ConditionalNeuralProcess(RegressorMixin, BaseEstimator):
             lr=self.lr,
             batch_size=self.batch_size,
             optimizer=self.optimizer,
+            optimizer__weight_decay=self.weight_decay,
             device=self.device,
             dataset=CNPDataset,  # special dataset to sample context and target sets
             criterion=CNPLoss,
             iterator_train__collate_fn=cnp_collate_fn,  # special collate to different n in episodes
             iterator_valid__collate_fn=cnp_collate_fn,
             callbacks=[
-                ("early_stopping", EarlyStopping(patience=10)),
+                ("early_stopping", EarlyStoppingCustom(patience=self.patience, load_best=True, threshold_mode='abs')), # patience=30
                 (
                     "lr_scheduler",
                     LRScheduler(policy="ReduceLROnPlateau", patience=5, factor=0.5),
                 ),
                 ("grad_norm", GradientNormClipping(gradient_clip_value=1.0)),
             ],
-            # train_split=None,
-            verbose=0,
+            verbose=self.verbose,
         )
         self.model_.fit(X, y)
         self.X_train_ = X
@@ -221,12 +227,22 @@ class ConditionalNeuralProcess(RegressorMixin, BaseEstimator):
     def predict(self, X, return_std=False):
         check_is_fitted(self)
         X = check_array(X, dtype=np.float32)
-        X_context = torch.from_numpy(self.X_train_).float().unsqueeze(0)
-        y_context = torch.from_numpy(self.y_train_).float().unsqueeze(0)
+        if not hasattr(self, 'r_') and isinstance(self.model_.module, CNPModule): 
+            X_context = torch.from_numpy(self.X_train_).float().unsqueeze(0)
+            y_context = torch.from_numpy(self.y_train_).float().unsqueeze(0)
+            context   = torch.cat([X_context, y_context], dim=-1)
+            self.r_ = self.model_.module_.encoder.net(context).mean(dim=1, keepdim=True) 
+        else:
+            X_context = torch.from_numpy(self.X_train_).float().unsqueeze(0)
+            y_context = torch.from_numpy(self.y_train_).float().unsqueeze(0)
         X_target = torch.from_numpy(X).float().unsqueeze(0)
 
+        self.model_.module_.eval()
         with torch.no_grad():
-            predictions = self.model_.module_.forward(X_context, y_context, X_target)
+            if isinstance(self.model_.module, CNPModule):
+                predictions = self.model_.module_.decoder(self.r_, X_target)
+            else:
+                predictions = self.model_.module_.forward(X_context, y_context, X_target)
 
         # needs to be float64 to pass estimator tests
         # squeeze out batch dimension again so that score() etc. runs
@@ -238,8 +254,7 @@ class ConditionalNeuralProcess(RegressorMixin, BaseEstimator):
         # undo normalization
         if self.normalize_y:
             mean = mean * self._y_train_std + self._y_train_mean
-            var = np.exp(logvar) * (self._y_train_std**2)
-            logvar = np.log(var)
+            logvar = logvar + 2.0 * np.log(self._y_train_std)
 
         # make sure predictions have the same shape as y
         if self.y_dim_ == 1:
