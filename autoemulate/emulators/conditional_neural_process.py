@@ -227,19 +227,19 @@ class ConditionalNeuralProcess(RegressorMixin, BaseEstimator):
     def predict(self, X, return_std=False):
         check_is_fitted(self)
         X = check_array(X, dtype=np.float32)
-        if not hasattr(self, 'r_') and isinstance(self.model_.module, CNPModule): 
+        if not hasattr(self, 'r_') and isinstance(self.model_.module_, CNPModule): 
             X_context = torch.from_numpy(self.X_train_).float().unsqueeze(0)
             y_context = torch.from_numpy(self.y_train_).float().unsqueeze(0)
             context   = torch.cat([X_context, y_context], dim=-1)
             self.r_ = self.model_.module_.encoder.net(context).mean(dim=1, keepdim=True) 
-        else:
+        elif not isinstance(self.model_.module_, CNPModule):
             X_context = torch.from_numpy(self.X_train_).float().unsqueeze(0)
             y_context = torch.from_numpy(self.y_train_).float().unsqueeze(0)
         X_target = torch.from_numpy(X).float().unsqueeze(0)
 
         self.model_.module_.eval()
         with torch.no_grad():
-            if isinstance(self.model_.module, CNPModule):
+            if isinstance(self.model_.module_, CNPModule):
                 predictions = self.model_.module_.decoder(self.r_, X_target)
             else:
                 predictions = self.model_.module_.forward(X_context, y_context, X_target)
